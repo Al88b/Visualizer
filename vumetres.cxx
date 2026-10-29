@@ -1,5 +1,6 @@
 
-//g++ main.cpp -o live_visualizer -lglfw -lGL -lm -lpthread -ldl
+//g++ vumetres.cxx -o live_visualizer -lglfw -lGL -lm -lpthread -ldl
+// Run from the repo folder so the TV frame PNG is found, or pass its path as the first argument.
 
 #include <GLFW/glfw3.h>
 #include <cmath>
@@ -14,11 +15,35 @@
 #define MINIAUDIO_IMPLEMENTATION
 #include "miniaudio.h"
 
+// PNG loading for the TV frame overlay
+#define STB_IMAGE_IMPLEMENTATION
+#define STBI_ONLY_PNG
+#include "stb_image.h"
+
 // Constants
+// Window matches the TV frame image's aspect ratio (800x645) so it isn't distorted
 const int WINDOW_WIDTH = 800;
-const int WINDOW_HEIGHT = 600;
+const int WINDOW_HEIGHT = 645;
 const int BUFFER_SIZE = 512; // Must be a power of 2 for the FFT
 const int EQ_BANDS = 32;
+
+// ---------------- TV FRAME OVERLAY ----------------
+const char* TV_FRAME_PATH = "istockphoto-157505991-612x612.png";
+
+// The transparent "screen" hole inside the TV image, as fractions of the image
+// size (image is 800x645, hole spans x 160..653, y 78..470 from the top).
+// The visualizer is rendered into this rectangle and the frame is drawn on top,
+// so the rounded corners of the bezel neatly mask the edges.
+const float SCREEN_LEFT   = 160.0f / 800.0f;
+const float SCREEN_RIGHT  = 654.0f / 800.0f;
+const float SCREEN_TOP    =  78.0f / 645.0f;
+const float SCREEN_BOTTOM = 471.0f / 645.0f;
+
+GLuint g_tvTexture = 0;
+
+// Aspect correction (height / width) of the area the visualizer is drawn into.
+// Updated every frame so the VU meter arcs stay circular.
+float g_viewAspect = (float)WINDOW_HEIGHT / WINDOW_WIDTH;
 
 // Shared safe buffers between Audio thread and OpenGL thread
 std::vector<float> g_waveformBuffer(BUFFER_SIZE, 0.0f);
@@ -231,7 +256,7 @@ void updateVUMeters(float dt) {
 // sizes are in normalised device coords. needle is 0..1 across the dial.
 void drawVUMeter(float cx, float bottom, float faceW, float faceH, float needle) {
     // The window isn't square, so squash x to keep the arc circular
-    const float xs = (float)WINDOW_HEIGHT / WINDOW_WIDTH;
+    const float xs = g_viewAspect;
     const float pivotY = bottom + faceH * 0.08f;
     const float R = faceH * 0.80f;
     const float zeroT = vuToDial(0.0f);
@@ -333,7 +358,48 @@ void drawVUMeters() {
     glDisable(GL_BLEND);
 }
 
-int main() {
+// Loads the PNG into an OpenGL texture. Returns 0 on failure.
+GLuint loadTexture(const char* path) {
+    int w, h, n;
+    unsigned char* data = stbi_load(path, &w, &h, &n, 4);
+    if (!data) {
+        std::cerr << "Could not load TV frame image '" << path << "': " << stbi_failure_reason() << "\n";
+        return 0;
+    }
+    GLuint tex;
+    glGenTextures(1, &tex);
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, data);
+    stbi_image_free(data);
+    return tex;
+}
+
+// Draws the TV frame stretched to the full window border, on top of everything.
+void drawTVFrame() {
+    if (!g_tvTexture) return;
+    glEnable(GL_TEXTURE_2D);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glBindTexture(GL_TEXTURE_2D, g_tvTexture);
+    glColor4f(1.0f, 1.0f, 1.0f, 1.0f);
+    glBegin(GL_QUADS);   // image rows run top-down, so v = 0 is the top edge
+        glTexCoord2f(0.0f, 1.0f); glVertex2f(-1.0f, -1.0f);
+        glTexCoord2f(1.0f, 1.0f); glVertex2f( 1.0f, -1.0f);
+        glTexCoord2f(1.0f, 0.0f); glVertex2f( 1.0f,  1.0f);
+        glTexCoord2f(0.0f, 0.0f); glVertex2f(-1.0f,  1.0f);
+    glEnd();
+    glDisable(GL_BLEND);
+    glDisable(GL_TEXTURE_2D);
+}
+
+int main(int argc, char** argv) {
+    if (argc > 1) TV_FRAME_PATH = argv[1];
+
     // ---- 1. Initialize miniaudio context to enumerate devices ----
     ma_context context;
     if (ma_context_init(NULL, 0, NULL, &context) != MA_SUCCESS) {
@@ -404,7 +470,8 @@ int main() {
     }
     glfwMakeContextCurrent(window);
 
-    glViewport(0, 0, WINDOW_WIDTH, WINDOW_HEIGHT);
+    g_tvTexture = loadTexture(TV_FRAME_PATH);
+
     glMatrixMode(GL_PROJECTION); glLoadIdentity();
     glMatrixMode(GL_MODELVIEW); glLoadIdentity();
 
@@ -415,20 +482,43 @@ int main() {
         float dt = (float)(now - lastTime);
         lastTime = now;
 
+        // Use the real framebuffer size so resizing / HiDPI screens work
+        int fbW, fbH;
+        glfwGetFramebufferSize(window, &fbW, &fbH);
+
+        glViewport(0, 0, fbW, fbH);
         glClearColor(0.04f, 0.04f, 0.06f, 1.0f);
         glClear(GL_COLOR_BUFFER_BIT);
 
         updateVUMeters(dt);
 
+        // 1. Visualizer squeezed into the TV's screen area (or the whole window
+        //    if the frame image couldn't be loaded)
+        if (g_tvTexture) {
+            int vx = (int)(SCREEN_LEFT * fbW);
+            int vw = (int)(SCREEN_RIGHT * fbW) - vx;
+            int vy = (int)((1.0f - SCREEN_BOTTOM) * fbH);   // GL origin is bottom-left
+            int vh = (int)((1.0f - SCREEN_TOP) * fbH) - vy;
+            glViewport(vx, vy, vw, vh);
+            g_viewAspect = (float)vh / vw;
+        } else {
+            g_viewAspect = (float)fbH / fbW;
+        }
+
         drawOscilloscope();
         drawEQGraph();
         drawVUMeters();   // drawn last so they sit on top of the bars
+
+        // 2. TV frame over the full window
+        glViewport(0, 0, fbW, fbH);
+        drawTVFrame();
 
         glfwSwapBuffers(window);
         glfwPollEvents();
     }
 
     // Cleanup everything
+    if (g_tvTexture) glDeleteTextures(1, &g_tvTexture);
     ma_device_uninit(&device);
     ma_context_uninit(&context);
     glfwTerminate();
